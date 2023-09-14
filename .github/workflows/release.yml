@@ -35,7 +35,12 @@ jobs:
       if: steps.cache.outputs.cache-hit != 'true'
       run: npm install
 
-    - name: Try to build the packages
+    - name: Create package tarballs
       id: build-packages
-      run: npm run build:packages
+      run: npm run pack
+
+    - name: Create release
+      with:
+        files: |
+          packages/*/*.tgz
 
