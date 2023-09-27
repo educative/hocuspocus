@@ -1,7 +1,7 @@
 import { IncomingHttpHeaders, IncomingMessage } from 'http'
 import { URLSearchParams } from 'url'
 import {
-  Forbidden, Unauthorized, WsReadyStates, ConnectionTimeout
+  Forbidden, Unauthorized, WsReadyStates, ConnectionTimeout,
 } from '@hocuspocus/common'
 import * as decoding from 'lib0/decoding'
 import { v4 as uuid } from 'uuid'
