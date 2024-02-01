@@ -8,7 +8,7 @@ import { v4 as uuid } from 'uuid'
 import WebSocket, { AddressInfo } from 'ws'
 import { Doc, applyUpdate, encodeStateAsUpdate } from 'yjs'
 import meta from '../package.json' assert { type: 'json' }
-import { Server as HocuspocusServer } from './Server'
+import { Server as HocuspocusServer } from './Server.js'
 import { ClientConnection } from './ClientConnection.js'
 // TODO: would be nice to only have a dependency on ClientConnection, and not on Connection
 import Connection from './Connection.js'
@@ -28,7 +28,7 @@ import {
   onStoreDocumentPayload,
 } from './types.js'
 import { getParameters } from './util/getParameters.js'
-import { useDebounce } from './util/debounce'
+import { useDebounce } from './util/debounce.js'
 
 export const defaultConfiguration = {
   name: null,
@@ -43,6 +43,7 @@ export const defaultConfiguration = {
     gcFilter: () => true,
   },
   unloadImmediately: true,
+  stopOnSignals: true,
 }
 
 /**
@@ -76,7 +77,7 @@ export class Hocuspocus {
 
   debugger = new Debugger()
 
-  debounce = useDebounce()
+  debouncer = useDebounce()
 
   constructor(configuration?: Partial<Configuration>) {
     if (configuration) {
@@ -116,6 +117,7 @@ export class Hocuspocus {
       connected: this.configuration.connected,
       onAuthenticate: this.configuration.onAuthenticate,
       onLoadDocument: this.configuration.onLoadDocument,
+      afterLoadDocument: this.configuration.afterLoadDocument,
       beforeHandleMessage: this.configuration.beforeHandleMessage,
       beforeBroadcastStateless: this.configuration.beforeBroadcastStateless,
       onStateless: this.configuration.onStateless,
@@ -124,6 +126,7 @@ export class Hocuspocus {
       afterStoreDocument: this.configuration.afterStoreDocument,
       onAwarenessUpdate: this.configuration.onAwarenessUpdate,
       onRequest: this.configuration.onRequest,
+      afterUnloadDocument: this.configuration.afterUnloadDocument,
       onDisconnect: this.configuration.onDisconnect,
       onDestroy: this.configuration.onDestroy,
     })
@@ -167,6 +170,17 @@ export class Hocuspocus {
     }
 
     this.server = new HocuspocusServer(this)
+
+    if (this.configuration.stopOnSignals) {
+      const signalHandler = async () => {
+        await this.destroy()
+        process.exit(0)
+      }
+
+      process.on('SIGINT', signalHandler)
+      process.on('SIGQUIT', signalHandler)
+      process.on('SIGTERM', signalHandler)
+    }
 
     return new Promise((resolve: Function, reject: Function) => {
       this.server?.httpServer.listen({
@@ -285,18 +299,30 @@ export class Hocuspocus {
    * Destroy the server
    */
   async destroy(): Promise<any> {
-    this.server?.httpServer?.close()
+    await new Promise(async resolve => {
 
-    try {
-      this.server?.webSocketServer?.close()
-      this.server?.webSocketServer?.clients.forEach(client => {
-        client.terminate()
-      })
-    } catch (error) {
-      console.error(error)
-    }
+      this.server?.httpServer?.close()
 
-    this.debugger.flush()
+      try {
+
+        this.configuration.extensions.push({
+          async afterUnloadDocument({ instance }) {
+            if (instance.getDocumentsCount() === 0) resolve('')
+          },
+        })
+
+        this.server?.webSocketServer?.close()
+        if (this.getDocumentsCount() === 0) resolve('')
+
+        this.closeConnections()
+
+      } catch (error) {
+        console.error(error)
+      }
+
+      this.debugger.flush()
+
+    })
 
     await this.hooks('onDestroy', { instance: this })
   }
@@ -326,19 +352,16 @@ export class Hocuspocus {
       }
 
       // If it’s the last connection, we need to make sure to store the
-      // document. Use the debounce helper, to clear running timers,
-      // but make it run immediately if configured.
+      // document. Use the debouncer executeNow helper, to run scheduled
+      // onStoreDocument immediately and clear running timers.
+      // If there is no scheduled run for this document there is no point in
+      // triggering onStoreDocument hook, as everything seems to be stored already.
       // Only run this if the document has finished loading earlier (i.e. not to persist the empty
       // ydoc if the onLoadDocument hook returned an error)
-      if (!document.isLoading) {
-        this.debounce(
-          `onStoreDocument-${document.name}`,
-          () => {
-            this.storeDocumentHooks(document, hookPayload)
-          },
-          this.configuration.unloadImmediately ? 0 : this.configuration.debounce,
-          this.configuration.maxDebounce,
-        )
+      if (!document.isLoading && this.debouncer.isDebounced(`onStoreDocument-${document.name}`)) {
+        if (this.configuration.unloadImmediately) {
+          this.debouncer.executeNow(`onStoreDocument-${document.name}`)
+        }
       } else {
         // Remove document from memory immediately
         this.unloadDocument(document)
@@ -374,15 +397,14 @@ export class Hocuspocus {
     // If the update was received through other ways than the
     // WebSocket connection, we don’t need to feel responsible for
     // storing the content.
-    if (!connection) {
+    // also ignore changes incoming through redis connection, as this would be a breaking change (#730, #696, #606)
+    if (!connection || (connection as unknown as string) === '__hocuspocus__redis__origin__') {
       return
     }
 
-    this.debounce(
+    this.debouncer.debounce(
       `onStoreDocument-${document.name}`,
-      () => {
-        this.storeDocumentHooks(document, hookPayload)
-      },
+      () => this.storeDocumentHooks(document, hookPayload),
       this.configuration.debounce,
       this.configuration.maxDebounce,
     )
@@ -462,15 +484,10 @@ export class Hocuspocus {
   }
 
   storeDocumentHooks(document: Document, hookPayload: onStoreDocumentPayload) {
-    this.hooks('onStoreDocument', hookPayload)
-      .catch(error => {
-        if (error?.message) {
-          throw error
-        }
-      })
+    return this.hooks('onStoreDocument', hookPayload)
       .then(() => {
         this.hooks('afterStoreDocument', hookPayload).then(() => {
-        // Remove document from memory.
+          // Remove document from memory.
 
           if (document.getConnectionsCount() > 0) {
             return
@@ -478,6 +495,13 @@ export class Hocuspocus {
 
           this.unloadDocument(document)
         })
+      })
+      .catch(error => {
+        console.error('Caught error during storeDocumentHooks', error)
+
+        if (error?.message) {
+          throw error
+        }
       })
   }
 

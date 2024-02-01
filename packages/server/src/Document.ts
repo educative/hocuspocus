@@ -33,6 +33,8 @@ export class Document extends Doc {
 
   isLoading: boolean
 
+  isDestroyed = false
+
   /**
    * Constructor.
    */
@@ -246,12 +248,19 @@ export class Document extends Doc {
   /**
    * Broadcast stateless message to all connections
    */
-  public broadcastStateless(payload: string): void {
+  public broadcastStateless(payload: string, filter?: (conn: Connection) => boolean): void {
     this.callbacks.beforeBroadcastStateless(this, payload)
 
-    this.getConnections().forEach(connection => {
+    const connections = filter ? this.getConnections().filter(filter) : this.getConnections()
+
+    connections.forEach(connection => {
       connection.sendStateless(payload)
     })
+  }
+
+  destroy() {
+    super.destroy()
+    this.isDestroyed = true
   }
 }
 
