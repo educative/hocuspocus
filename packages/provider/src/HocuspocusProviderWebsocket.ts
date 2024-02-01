@@ -2,7 +2,6 @@ import {
   Forbidden, MessageTooBig, Unauthorized, WsReadyStates,
 } from '@hocuspocus/common'
 import { retry } from '@lifeomic/attempt'
-import * as mutex from 'lib0/mutex'
 import * as time from 'lib0/time'
 import * as url from 'lib0/url'
 import type { MessageEvent } from 'ws'
@@ -14,6 +13,9 @@ import {
   onAwarenessChangeParameters, onAwarenessUpdateParameters,
   onCloseParameters, onDisconnectParameters, onMessageParameters, onOpenParameters, onOutgoingMessageParameters, onStatusParameters,
 } from './types.js'
+import { IncomingMessage } from './IncomingMessage.js'
+
+export type HocusPocusWebSocket = WebSocket & { identifier: string };
 
 export type HocuspocusProviderWebsocketConfiguration =
   Required<Pick<CompleteHocuspocusProviderWebsocketConfiguration, 'url'>>
@@ -89,6 +91,11 @@ export interface CompleteHocuspocusProviderWebsocketConfiguration {
    * Don’t output any warnings.
    */
   quiet: boolean,
+
+  /**
+   * Map of attached providers keyed by documentName.
+   */
+  providerMap: Map<string, HocuspocusProvider>,
 }
 
 export class HocuspocusProviderWebsocket extends EventEmitter {
@@ -132,11 +139,12 @@ export class HocuspocusProviderWebsocket extends EventEmitter {
     onAwarenessUpdate: () => null,
     onAwarenessChange: () => null,
     quiet: false,
+    providerMap: new Map(),
   }
 
-  subscribedToBroadcastChannel = false
+  webSocket: HocusPocusWebSocket | null = null
 
-  webSocket: WebSocket | null = null
+  webSocketHandlers: { [key: string]: any } = {}
 
   shouldConnect = true
 
@@ -144,7 +152,7 @@ export class HocuspocusProviderWebsocket extends EventEmitter {
 
   lastMessageReceived = 0
 
-  mux = mutex.createMutex()
+  identifier = 0
 
   intervals: any = {
     forceSync: null,
@@ -152,15 +160,17 @@ export class HocuspocusProviderWebsocket extends EventEmitter {
   }
 
   connectionAttempt: {
-    resolve: (value?: any) => void
-    reject: (reason?: any) => void
+    resolve: (value?: any) => void;
+    reject: (reason?: any) => void;
   } | null = null
 
   constructor(configuration: HocuspocusProviderWebsocketConfiguration) {
     super()
     this.setConfiguration(configuration)
 
-    this.configuration.WebSocketPolyfill = configuration.WebSocketPolyfill ? configuration.WebSocketPolyfill : WebSocket
+    this.configuration.WebSocketPolyfill = configuration.WebSocketPolyfill
+      ? configuration.WebSocketPolyfill
+      : WebSocket
 
     this.on('open', this.configuration.onOpen)
     this.on('open', this.onOpen.bind(this))
@@ -177,8 +187,6 @@ export class HocuspocusProviderWebsocket extends EventEmitter {
 
     this.on('close', this.onClose.bind(this))
     this.on('message', this.onMessage.bind(this))
-
-    this.registerEventListeners()
 
     this.intervals.connectionChecker = setInterval(
       this.checkConnection.bind(this),
@@ -209,8 +217,11 @@ export class HocuspocusProviderWebsocket extends EventEmitter {
   }
 
   attach(provider: HocuspocusProvider) {
+    let connectPromise: Promise<any> | undefined
+    this.configuration.providerMap.set(provider.configuration.name, provider)
+
     if (this.status === WebSocketStatus.Disconnected && this.shouldConnect) {
-      this.connect()
+      connectPromise = this.connect()
     }
 
     if (this.receivedOnOpenPayload) {
@@ -220,18 +231,19 @@ export class HocuspocusProviderWebsocket extends EventEmitter {
     if (this.receivedOnStatusPayload) {
       provider.onStatus(this.receivedOnStatusPayload)
     }
+
+    return connectPromise
   }
 
   detach(provider: HocuspocusProvider) {
-    // tell the server to remove the listener
-
+    this.configuration.providerMap.delete(provider.configuration.name)
   }
 
-  public setConfiguration(configuration: Partial<HocuspocusProviderWebsocketConfiguration> = {}): void {
+  public setConfiguration(
+    configuration: Partial<HocuspocusProviderWebsocketConfiguration> = {},
+  ): void {
     this.configuration = { ...this.configuration, ...configuration }
   }
-
-  boundConnect = this.connect.bind(this)
 
   cancelWebsocketRetry?: () => void
 
@@ -289,24 +301,60 @@ export class HocuspocusProviderWebsocket extends EventEmitter {
     return retryPromise
   }
 
+  attachWebSocketListeners(ws: HocusPocusWebSocket, reject: Function) {
+    const { identifier } = ws
+    const onMessageHandler = (payload: any) => this.emit('message', payload)
+    const onCloseHandler = (payload: any) => this.emit('close', { event: payload })
+    const onOpenHandler = (payload: any) => this.emit('open', payload)
+    const onErrorHandler = (err: any) => {
+      reject(err)
+    }
+
+    this.webSocketHandlers[identifier] = {
+      message: onMessageHandler,
+      close: onCloseHandler,
+      open: onOpenHandler,
+      error: onErrorHandler,
+    }
+
+    const handlers = this.webSocketHandlers[ws.identifier]
+
+    Object.keys(handlers).forEach(name => {
+      ws.addEventListener(name, handlers[name])
+    })
+  }
+
+  cleanupWebSocket() {
+    if (!this.webSocket) {
+      return
+    }
+    const { identifier } = this.webSocket
+    const handlers = this.webSocketHandlers[identifier]
+
+    Object.keys(handlers).forEach(name => {
+      this.webSocket?.removeEventListener(name, handlers[name])
+    })
+    delete this.webSocketHandlers[identifier]
+    this.webSocket.close()
+    this.webSocket = null
+  }
+
   createWebSocketConnection() {
     return new Promise((resolve, reject) => {
       if (this.webSocket) {
         this.messageQueue = []
-        this.webSocket.close()
-        this.webSocket = null
+        this.cleanupWebSocket()
       }
       this.lastMessageReceived = 0
+      this.identifier += 1
 
       // Init the WebSocket connection
       const ws = new this.configuration.WebSocketPolyfill(this.url)
       ws.binaryType = 'arraybuffer'
-      ws.onmessage = (payload: any) => this.emit('message', payload)
-      ws.onclose = (payload: any) => this.emit('close', { event: payload })
-      ws.onopen = (payload: any) => this.emit('open', payload)
-      ws.onerror = (err: any) => {
-        reject(err)
-      }
+      ws.identifier = this.identifier
+
+      this.attachWebSocketListeners(ws, reject)
+
       this.webSocket = ws
 
       // Reset the status
@@ -325,6 +373,11 @@ export class HocuspocusProviderWebsocket extends EventEmitter {
     this.resolveConnectionAttempt()
 
     this.lastMessageReceived = time.getUnixTime()
+
+    const message = new IncomingMessage(event.data)
+    const documentName = message.peekVarString()
+
+    this.configuration.providerMap.get(documentName)?.onMessage(event)
   }
 
   resolveConnectionAttempt() {
@@ -363,7 +416,10 @@ export class HocuspocusProviderWebsocket extends EventEmitter {
     }
 
     // Don’t close the connection when a message was received recently
-    if (this.configuration.messageReconnectTimeout >= time.getUnixTime() - this.lastMessageReceived) {
+    if (
+      this.configuration.messageReconnectTimeout
+      >= time.getUnixTime() - this.lastMessageReceived
+    ) {
       return
     }
 
@@ -384,15 +440,6 @@ export class HocuspocusProviderWebsocket extends EventEmitter {
       this.webSocket?.close()
       this.messageQueue = []
     }
-
-  }
-
-  registerEventListeners() {
-    if (typeof window === 'undefined') {
-      return
-    }
-
-    window.addEventListener('online', this.boundConnect)
   }
 
   // Ensure that the URL always ends with /
@@ -435,7 +482,7 @@ export class HocuspocusProviderWebsocket extends EventEmitter {
 
   onClose({ event }: onCloseParameters) {
     this.closeTries = 0
-    this.webSocket = null
+    this.cleanupWebSocket()
 
     if (this.status === WebSocketStatus.Connected) {
       this.status = WebSocketStatus.Disconnected
@@ -445,9 +492,13 @@ export class HocuspocusProviderWebsocket extends EventEmitter {
 
     if (event.code === Unauthorized.code) {
       if (event.reason === Unauthorized.reason) {
-        console.warn('[HocuspocusProvider] An authentication token is required, but you didn’t send one. Try adding a `token` to your HocuspocusProvider configuration. Won’t try again.')
+        console.warn(
+          '[HocuspocusProvider] An authentication token is required, but you didn’t send one. Try adding a `token` to your HocuspocusProvider configuration. Won’t try again.',
+        )
       } else {
-        console.warn(`[HocuspocusProvider] Connection closed with status Unauthorized: ${event.reason}`)
+        console.warn(
+          `[HocuspocusProvider] Connection closed with status Unauthorized: ${event.reason}`,
+        )
       }
 
       this.shouldConnect = false
@@ -455,13 +506,17 @@ export class HocuspocusProviderWebsocket extends EventEmitter {
 
     if (event.code === Forbidden.code) {
       if (!this.configuration.quiet) {
-        console.warn('[HocuspocusProvider] The provided authentication token isn’t allowed to connect to this server. Will try again.')
+        console.warn(
+          '[HocuspocusProvider] The provided authentication token isn’t allowed to connect to this server. Will try again.',
+        )
         return // TODO REMOVE ME
       }
     }
 
     if (event.code === MessageTooBig.code) {
-      console.warn(`[HocuspocusProvider] Connection closed with status MessageTooBig: ${event.reason}`)
+      console.warn(
+        `[HocuspocusProvider] Connection closed with status MessageTooBig: ${event.reason}`,
+      )
       this.shouldConnect = false
     }
 
@@ -507,11 +562,6 @@ export class HocuspocusProviderWebsocket extends EventEmitter {
 
     this.removeAllListeners()
 
-    if (typeof window === 'undefined') {
-      return
-    }
-
-    window.removeEventListener('online', this.boundConnect)
+    this.cleanupWebSocket()
   }
-
 }

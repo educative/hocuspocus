@@ -1,7 +1,8 @@
 export const useDebounce = () => {
   const timers: Map<string, {
     timeout: NodeJS.Timeout,
-    start: number
+    start: number,
+    func: Function
   }> = new Map()
 
   const debounce = (
@@ -15,7 +16,7 @@ export const useDebounce = () => {
 
     const run = () => {
       timers.delete(id)
-      func()
+      return func()
     }
 
     if (old?.timeout) {
@@ -33,8 +34,21 @@ export const useDebounce = () => {
     timers.set(id, {
       start,
       timeout: setTimeout(run, debounce),
+      func: run,
     })
   }
 
-  return debounce
+  const executeNow = (id: string) => {
+    const old = timers.get(id)
+    if (old) {
+      clearTimeout(old.timeout)
+      return old.func()
+    }
+  }
+
+  const isDebounced = (id: string): boolean => {
+    return timers.has(id)
+  }
+
+  return { debounce, isDebounced, executeNow }
 }
