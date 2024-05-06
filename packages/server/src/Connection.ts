@@ -225,10 +225,12 @@ export class Connection {
 
     this.callbacks.beforeHandleMessage(this, data)
       .then(() => {
+        const currentTime = Date.now()
         new MessageReceiver(
           message,
           this.logger,
         ).apply(this.document, this)
+        this.logger.log(`Applied message on ${documentName} in ${Date.now() - currentTime}ms`)
       })
       .catch((e: any) => {
         console.log('closing connection because of exception', e)
