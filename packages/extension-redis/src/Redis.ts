@@ -294,6 +294,7 @@ export class Redis implements Extension {
       return
     }
 
+    const currentMs = Date.now()
     new MessageReceiver(
       message,
       this.logger,
@@ -304,6 +305,7 @@ export class Redis implements Extension {
         this.encodeMessage(reply),
       )
     })
+    this.logger.log(`Applied message on ${documentName} in ${Date.now() - currentMs}ms`)
   }
 
   /**
